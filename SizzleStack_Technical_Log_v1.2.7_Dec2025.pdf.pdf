@@ -1,0 +1,1622 @@
+# SizzleStack Technical Build Log
+
+**Version:** 1.2.7  
+**Last Updated:** 2025-11-28  
+**Target Audience:** IT Professionals, AI Systems, Technical Reviewers
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#executive-summary)
+2. [Mythic/Lore Terminology Note](#a-note-on-mythiclore-terminology)
+3. [System Architecture](#system-architecture)
+4. [Core Subsystems](#core-subsystems)
+5. [SizzleBridge Architecture](#sizzlebridge-architecture)
+6. [Service Dependency Map](#service-dependency-map)
+7. [Data Flow Diagrams](#data-flow-diagrams)
+8. [Error Handling Patterns](#error-handling-patterns)
+9. [Scheduled Jobs Inventory](#scheduled-jobs-inventory)
+10. [Mythic-to-Business Name Mapping](#mythic-to-business-name-mapping)
+11. [Seed Data Structure](#seed-data-structure)
+12. [POS Connector Testing Notes](#pos-connector-testing-notes)
+13. [Known Technical Debt](#known-technical-debt)
+14. [Authentication & Security](#authentication--security)
+15. [Database Schema Summary](#database-schema-summary)
+16. [Coded But Not UI-Exposed Features](#coded-but-not-ui-exposed-features)
+17. [API Endpoints Summary](#api-endpoints-summary)
+18. [Environment Variables](#environment-variables)
+19. [Testing](#testing)
+20. [Deployment](#deployment)
+21. [Canonical Event Taxonomy](#canonical-event-taxonomy)
+22. [Change Log](#change-log)
+
+---
+
+## Executive Summary
+
+SizzleStack is a Flask-based restaurant intelligence platform providing ingredient-level operational analytics, labour optimization, and supplier intelligence. SizzleBridge is the POS connector abstraction layer enabling multi-vendor data normalization from Toast, Square, Windcave, Xero, and Lightspeed.
+
+**Primary Value Proposition:** Demonstrate 80%+ operational efficiency gains over Toast/Square POS systems through:
+1. **Food Cost Recovery:** Supplier overcharge detection, price-creep alerts
+2. **Labour Cost Recovery:** Overstaffing detection, roster-to-actuals variance
+3. **Automation Savings:** Invoice OCR, predictive ordering, auto-scheduling
+
+**Architecture Pattern:** Flask monolith with service layer pattern, SQLAlchemy ORM, multi-tenant isolation via `customer_id` foreign keys.
+
+---
+
+## A Note on Mythic/Lore Terminology
+
+Early development adopted an elaborate narrative naming convention ("Sacred Scrolls," "Oracle Brain," "Keeper of the Flame," etc.) intended to create memorable branding and internal culture. **This terminology is deprecated for production use.** While the underlying business logic is sound, the naming creates confusion for technical audiences and violates enterprise documentation standards.
+
+**Current Status:** Core services retain functional implementations but carry legacy naming. A gradual refactoring effort is renaming services to conventional enterprise patterns (e.g., `KeeperOfTheFlame` → `InventoryManagementService`). Documentation now uses standard technical terminology; legacy names appear in code comments for mapping purposes only.
+
+---
+
+## System Architecture
+
+### Technology Stack
+
+| Layer | Technology | Notes |
+|-------|------------|-------|
+| Runtime | Python 3.11 | NixOS environment |
+| Framework | Flask 3.x | Gunicorn WSGI |
+| ORM | SQLAlchemy 2.x | Declarative base |
+| Database | PostgreSQL (Neon) | Multi-tenant isolation |
+| Auth | Flask-Login | TOTP 2FA support |
+| Payments | Stripe API | Invoice-based billing |
+| Email | SendGrid | Transactional + alerts |
+| AI/OCR | OpenAI Vision (gpt-4o-mini) | Invoice parsing |
+| POS Connectors | Toast, Square, Windcave | Via SizzleBridge |
+| Accounting | Xero API | Reconciliation |
+
+### Directory Structure
+
+```
+sizzlestack/
+├── app.py                 # Flask app factory, DB init
+├── main.py                # WSGI entry point
+├── models.py              # SQLAlchemy models (60+ tables)
+├── routes.py              # Route definitions (~11k lines)
+├── database.py            # Session management, tenant context
+├── seed_data.py           # Demo/development data seeder
+├── services/              # Domain services (70+ modules)
+│   ├── invoicing_service.py
+│   ├── labour_optimization_service.py
+│   ├── variance_analysis_service.py
+│   ├── supplier_intelligence_service.py
+│   ├── financial_congruence_service.py
+│   ├── sales_forecasting_service.py
+│   ├── invoice_ocr_service.py
+│   ├── roster_notification_service.py  # Toasted Kiwi branded roster emails
+│   ├── staff_scheduling_email_service.py
+│   └── [...]
+├── sizzlebridge/          # POS connector abstraction
+│   ├── core/
+│   │   ├── dispatcher.py  # Unified connector dispatch
+│   │   └── normalizer.py  # Vendor-agnostic data transform
+│   ├── connectors/
+│   │   ├── toast.py
+│   │   ├── square.py
+│   │   ├── windcave_connector.py
+│   │   ├── xero_connector.py
+│   │   └── stripe_connector.py
+│   └── schemas/
+│       └── normalized_models.py  # BaseSale, BaseSaleItem
+├── templates/             # Jinja2 templates
+│   ├── email/             # Email templates (Jinja2)
+│   │   └── roster_confirmation.html  # Toasted Kiwi branded roster email
+│   └── [...]
+├── static/                # CSS, JS, assets
+├── utils/                 # Tenant context, helpers
+└── tests/                 # pytest test suite
+```
+
+---
+
+## Core Subsystems
+
+### 1. Multi-Tenant Architecture
+
+**Pattern:** Row-level tenant isolation via `customer_id` FK on all tenant-scoped tables.
+
+**Implementation:**
+- `TenantContext` utility stores current tenant in Flask `g` object
+- All queries filter by `TenantContext.get_customer_id()`
+- Middleware validates tenant access on protected routes
+- SaaS admin routes bypass tenant context for cross-tenant management
+
+**Key Models:**
+```python
+Customer          # Tenant root (company_name, subscription_tier, billing fields)
+CustomerVenue     # Multi-location support within tenant
+User              # Tenant-scoped users with roles
+```
+
+### 2. Billing & Invoicing System
+
+**File:** `services/invoicing_service.py`
+
+**Invoice Cycle:**
+- Invoices generated on 1st of month for previous month's service
+- Due date: 20th of invoice month (Net 20 terms)
+- Auto-charge card on file if unpaid past due date
+
+**Models:**
+```python
+CustomerInvoice   # invoice_number, period_start/end, amounts (cents), status
+Customer          # stripe_customer_id, stripe_payment_method_id, monthly_rate
+```
+
+**Payment Flow:**
+1. `InvoicingService.create_invoice_for_customer()` → draft invoice
+2. `InvoicingService.send_invoice_email()` → SendGrid dispatch, status='sent'
+3. `InvoicingService.charge_invoice()` → Stripe PaymentIntent off-session
+4. `InvoicingService.process_overdue_invoices()` → batch auto-charge
+
+**Stripe Integration:**
+- Checkout Sessions for card setup (mode='setup')
+- PaymentIntents for off-session charges
+- Customer portal for self-service
+
+### 3. Inventory Intelligence
+
+**Files:** `services/variance_analysis_service.py`, `services/recipe_consumption_service.py`, `services/reorder_intelligence_service.py`
+
+**Core Models:**
+```python
+InventoryItem     # name, quantity, unit_cost, reorder_point, category
+Recipe            # name, sale_price, components[]
+RecipeComponent   # recipe_id, ingredient_id, quantity, unit
+IngredientConsumptionEvent  # Links sales to ingredient deductions
+WasteEvent        # Manual waste logging with reason codes
+```
+
+**Variance Analysis:**
+- Theoretical consumption calculated from RecipeSale events
+- Actual consumption tracked via IngredientConsumptionEvent
+- Variance = |theoretical - actual| with configurable thresholds
+- Real-time alerts for variance > threshold
+
+### 4. Labour Intelligence
+
+**Files:** `services/labour_optimization_service.py`, `services/overstaffing_detection_service.py`, `services/labour_variance_service.py`
+
+**Core Models:**
+```python
+StaffRoster       # staff_id, date, shift_start/end, position
+ClockEvent        # staff_id, event_type (clock_in/out), timestamp
+LabourVariancePeriod  # Aggregated variance by period
+LabourBudget      # Position-based staffing targets
+```
+
+**Key Metrics:**
+- Roster-to-Actuals variance (planned vs worked hours)
+- Overstaffing detection with $ quantification
+- Position-based efficiency (barista, floor, kitchen ratios)
+- Sales-per-labour-hour targets
+
+### 5. Supplier Intelligence
+
+**Files:** `services/supplier_intelligence_service.py`, `services/supplier_catalog_service.py`
+
+**Core Models:**
+```python
+Supplier          # name, contact, payment_terms, lead_time_days
+SupplierProduct   # supplier_id, product_name, sku, unit_price
+SupplierPriceHistory  # Price tracking over time (price-creep detection)
+SupplierPerformance   # Delivery reliability, quality scores
+```
+
+**Features:**
+- Multi-criteria supplier recommendations
+- Price-creep detection with threshold alerts
+- Auto-generated credit request emails
+- Supplier catalog auto-learning from invoices
+
+### 6. Financial Congruence Engine
+
+**File:** `services/financial_congruence_service.py`
+
+**Purpose:** Cross-validate rosters, purchase orders, and sales forecasts for financial alignment.
+
+**Key Features:**
+- Ingredient-specific shelf life buffers
+- Supplier lead time tracking with automatic buffer adjustments
+- Pattern-based annual projections
+- $50 absolute OR 10% relative variance thresholds
+- Holiday-aware calculations (NZ public holidays)
+- Override workflow with audit logging
+
+### 7. Sales Forecasting
+
+**File:** `services/sales_forecasting_service.py`
+
+**Two-Track System:**
+1. **Bootstrap Mode:** Industry benchmarks for new stores
+2. **Historical Mode:** Seasonal decomposition for established stores
+
+**Features:**
+- NZ public holidays 2025 integration
+- Event multipliers (local events, weather)
+- Confidence scoring per forecast
+- 7-day and 30-day forecast windows
+
+### 8. Invoice OCR
+
+**File:** `services/invoice_ocr_service.py`
+
+**Stack:** OpenAI Vision API (gpt-4o-mini)
+
+**Flow:**
+1. Mobile photo upload or PDF ingestion
+2. OpenAI Vision extracts structured data
+3. Auto-matching to existing supplier catalog
+4. PO variance detection (ordered vs received)
+5. Automatic inventory updates on approval
+
+---
+
+## SizzleBridge Architecture
+
+### Purpose
+
+Unified abstraction layer for POS and payment connectors enabling vendor-agnostic data normalization.
+
+### Core Components
+
+**1. Dispatcher** (`sizzlebridge/core/dispatcher.py`)
+```python
+def dispatch_connector(connector_name: str, payload: dict) -> Dict[str, Any]:
+    """Routes payment requests to appropriate connector with audit logging"""
+```
+
+**2. Normalizer** (`sizzlebridge/core/normalizer.py`)
+```python
+def normalize_toast_sale(toast_sale_data: Dict) -> BaseSale:
+def normalize_square_sale(square_sale_data: Dict) -> BaseSale:
+```
+
+**3. Normalized Schema** (`sizzlebridge/schemas/normalized_models.py`)
+```python
+@dataclass
+class BaseSale:
+    id: str
+    date: datetime
+    amount: Decimal
+    items: List[BaseSaleItem]
+    customer_id: Optional[str]
+    payment_method: Optional[str]
+    tax_amount: Decimal
+    tip_amount: Decimal
+    source_system: str  # 'toast', 'square', 'windcave'
+```
+
+### Connector Status
+
+| Connector | Status | Capabilities |
+|-----------|--------|--------------|
+| Square | Active | Sales sync, catalog, payments |
+| Toast | Active | Orders, checks, payments |
+| Windcave | Active | Payment processing (NZ) |
+| Xero | Active | Invoice sync, reconciliation |
+| Lightspeed | Scaffold | Basic structure, not production |
+| Stripe | Active | Billing, subscriptions |
+
+---
+
+## Service Dependency Map
+
+### Tier 1: Core Infrastructure (No Dependencies)
+```
+database.py                     # Session management, tenant context
+models.py                       # SQLAlchemy model definitions
+utils/tenant_context.py         # TenantContext singleton
+```
+
+### Tier 2: Foundation Services (Depend on Tier 1 only)
+```
+services/sizzle_log_system.py   # SizzleChronicler, audit logging
+services/stripe_service.py      # Stripe API wrapper
+services/low_stock_alert_service.py
+```
+
+### Tier 3: Domain Services (Depend on Tier 1-2)
+```
+services/variance_analysis_service.py
+    └── services/make_bench_waste_service.py
+
+services/recipe_consumption_service.py
+    └── services/sizzlebridge_proxy.py
+
+services/labour_variance_service.py
+
+services/supplier_intelligence_service.py
+
+services/reorder_intelligence_service.py
+    └── services/supplier_intelligence_service.py
+
+services/invoice_ocr_service.py
+    ├── services/po_matching_service.py
+    └── services/po_receiving_service.py
+
+services/roster_notification_service.py  # Toasted Kiwi branded roster emails
+    └── utils/email_service.py (SendGrid)
+
+services/staff_scheduling_email_service.py
+    └── services/roster_notification_service.py
+```
+
+### Tier 4: Orchestration Services (Depend on Multiple Tier 3)
+```
+services/unified_analytics_service.py
+    ├── services/overstaffing_detection_service.py
+    ├── services/variance_analysis_service.py
+    └── services/low_stock_alert_service.py
+
+services/command_center_cache_service.py
+    └── services/unified_analytics_service.py
+
+services/pos_sync_service.py
+    ├── services/recipe_consumption_service.py
+    └── services/sizzlebridge_proxy.py
+
+services/overstaffing_detection_service.py
+    └── services/labour_variance_service.py
+```
+
+### Tier 5: Integration Layer (External Systems)
+```
+services/live_oracle_integration.py
+    ├── services/live_data_collector.py
+    ├── services/realtime_alert_system.py
+    ├── services/emotional_intelligence_layer.py
+    ├── services/demo_mode_system.py
+    ├── services/oracle_brain_interpreter.py
+    └── services/loom_of_the_week_agent.py
+
+services/xero_reconciliation_engine.py
+    ├── services/guardian_of_gold.py
+    └── services/sizzle_log_system.py
+```
+
+### Circular Dependency Prevention
+- All cross-service imports use lazy loading (inside methods, not at module level)
+- No service imports another service at the top of the file
+- Shared data types defined in `models.py`, not in services
+
+---
+
+## Data Flow Diagrams
+
+### 1. Invoice OCR to Inventory Update
+
+```
+┌─────────────────┐     ┌───────────────────┐     ┌──────────────────┐
+│  Mobile Photo   │────▶│  invoice_ocr_     │────▶│  po_matching_    │
+│  Upload         │     │  service.py       │     │  service.py      │
+└─────────────────┘     │  (OpenAI Vision)  │     │  (4-tier match)  │
+                        └───────────────────┘     └────────┬─────────┘
+                                                           │
+                        ┌───────────────────┐     ┌────────▼─────────┐
+                        │  InventoryItem    │◀────│  po_receiving_   │
+                        │  (qty update)     │     │  service.py      │
+                        └───────────────────┘     └──────────────────┘
+                                                           │
+                        ┌───────────────────┐     ┌────────▼─────────┐
+                        │  SupplierPrice    │◀────│  Price creep     │
+                        │  History          │     │  detection       │
+                        └───────────────────┘     └──────────────────┘
+```
+
+### 2. Sales Event to Variance Calculation
+
+```
+┌─────────────────┐     ┌───────────────────┐     ┌──────────────────┐
+│  POS Sale       │────▶│  pos_sync_        │────▶│  recipe_         │
+│  (Toast/Square) │     │  service.py       │     │  consumption_    │
+└─────────────────┘     │  (SizzleBridge)   │     │  service.py      │
+                        └───────────────────┘     └────────┬─────────┘
+                                                           │
+                        ┌───────────────────┐     ┌────────▼─────────┐
+                        │  Ingredient       │◀────│  Theoretical     │
+                        │  Consumption      │     │  Deduction       │
+                        │  Event            │     │  Calculation     │
+                        └────────┬──────────┘     └──────────────────┘
+                                 │
+                        ┌────────▼──────────┐     ┌──────────────────┐
+                        │  variance_        │────▶│  Alert if        │
+                        │  analysis_        │     │  threshold       │
+                        │  service.py       │     │  exceeded        │
+                        └───────────────────┘     └──────────────────┘
+```
+
+### 3. Clock Event to Overstaffing Alert
+
+```
+┌─────────────────┐     ┌───────────────────┐     ┌──────────────────┐
+│  Staff Clock    │────▶│  ClockEvent       │────▶│  labour_         │
+│  In/Out         │     │  Model            │     │  variance_       │
+└─────────────────┘     └───────────────────┘     │  service.py      │
+                                                  └────────┬─────────┘
+                                                           │
+┌─────────────────┐     ┌───────────────────┐     ┌────────▼─────────┐
+│  StaffRoster    │────▶│  Planned vs       │────▶│  overstaffing_   │
+│  (scheduled)    │     │  Actual Hours     │     │  detection_      │
+└─────────────────┘     └───────────────────┘     │  service.py      │
+                                                  └────────┬─────────┘
+                                                           │
+                        ┌───────────────────┐     ┌────────▼─────────┐
+                        │  Labour           │◀────│  $ Quantified    │
+                        │  Variance         │     │  Overstaffing    │
+                        │  Period           │     │  Alert           │
+                        └───────────────────┘     └──────────────────┘
+```
+
+### 4. Monthly Invoice Lifecycle
+
+```
+┌─────────────────┐     ┌───────────────────┐     ┌──────────────────┐
+│  1st of Month   │────▶│  invoicing_       │────▶│  CustomerInvoice │
+│  (Cron/Manual)  │     │  service.py       │     │  status='draft'  │
+└─────────────────┘     │  create_invoice   │     └────────┬─────────┘
+                        └───────────────────┘              │
+                                                  ┌────────▼─────────┐
+                        ┌───────────────────┐     │  send_invoice_   │
+                        │  SendGrid Email   │◀────│  email()         │
+                        │  with Pay Link    │     │  status='sent'   │
+                        └───────────────────┘     └────────┬─────────┘
+                                                           │
+┌─────────────────┐                               ┌────────▼─────────┐
+│  Customer Pays  │──────────────────────────────▶│  status='paid'   │
+│  via Link       │                               └──────────────────┘
+└─────────────────┘                                        │
+        OR                                                 │
+┌─────────────────┐     ┌───────────────────┐     ┌────────▼─────────┐
+│  Due Date       │────▶│  process_overdue  │────▶│  Stripe          │
+│  Passes (20th)  │     │  _invoices()      │     │  PaymentIntent   │
+└─────────────────┘     └───────────────────┘     │  (off_session)   │
+                                                  └────────┬─────────┘
+                                                           │
+                                                  ┌────────▼─────────┐
+                                                  │  status=         │
+                                                  │  'auto_charged'  │
+                                                  └──────────────────┘
+```
+
+---
+
+## Error Handling Patterns
+
+### Logging Convention
+
+All services follow a consistent emoji-prefixed logging pattern:
+
+```python
+logger.info(f"📄 Invoice created: {invoice_number}")      # Success operations
+logger.info(f"💳 Payment method saved for {company}")     # Financial operations
+logger.info(f"📧 Invoice email sent to {email}")          # Communications
+logger.warning(f"⚠️ Recipe has no ingredients")           # Recoverable issues
+logger.warning(f"💳 Card declined: {message}")            # Expected failures
+logger.error(f"❌ Error creating invoice: {e}")           # Unexpected errors
+```
+
+### Exception Handling Strategy
+
+**1. Service Layer Pattern:**
+```python
+@classmethod
+def some_operation(cls, session, entity) -> Dict[str, Any]:
+    try:
+        # Business logic
+        return {'success': True, 'data': result}
+    except SpecificError as e:
+        logger.warning(f"⚠️ Expected error: {e}")
+        return {'success': False, 'error': str(e)}
+    except Exception as e:
+        logger.error(f"❌ Unexpected error: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
+```
+
+**2. Route Layer Pattern:**
+```python
+result = SomeService.operation(session, entity)
+session.commit()
+
+if result['success']:
+    flash(f"Success: {result['message']}", 'success')
+else:
+    flash(f"Error: {result.get('error')}", 'error')
+```
+
+### External API Error Handling
+
+**Stripe:**
+```python
+try:
+    payment_intent = stripe.PaymentIntent.create(...)
+except stripe.error.CardError as e:
+    # Card was declined - expected, log and return gracefully
+    return {'success': False, 'error': e.user_message}
+except stripe.error.StripeError as e:
+    # API error - log with full context
+    logger.error(f"Stripe API error: {e}", exc_info=True)
+    return {'success': False, 'error': 'Payment service unavailable'}
+```
+
+**OpenAI (Invoice OCR):**
+```python
+for attempt in range(max_retries):
+    try:
+        response = openai.chat.completions.create(...)
+        break
+    except Exception as e:
+        logger.warning(f"OpenAI API call failed (attempt {attempt + 1}): {e}")
+        if attempt == max_retries - 1:
+            logger.error(f"OpenAI API failed after {max_retries} attempts")
+            return {'success': False, 'error': 'OCR service unavailable'}
+```
+
+### Tenant Isolation Errors
+
+```python
+# All tenant-scoped queries include customer_id filter
+customer_id = TenantContext.get_customer_id()
+if not customer_id:
+    logger.error("❌ No tenant context available")
+    raise TenantContextError("Authentication required")
+
+# Query always includes tenant filter
+items = session.query(InventoryItem).filter_by(customer_id=customer_id).all()
+```
+
+---
+
+## Scheduled Jobs Inventory
+
+### APScheduler Automated Jobs (v1.2.4+)
+
+| Job | Function | Schedule | Purpose |
+|-----|----------|----------|---------|
+| POS Data Sync | `execute_pos_sync(customer_id)` | Every 5 minutes | Real-time sales sync from Toast/Square via SizzleBridge |
+| Forecast Refresh | `execute_forecast_refresh(customer_id)` | Daily at 02:00 | Recalculate sales forecasts overnight |
+| Alert Health Check | `execute_alert_health_check()` | Every 1 minute | System-wide alert monitoring |
+
+**Implementation Details:**
+- **Scheduler:** APScheduler 3.x with SQLAlchemyJobStore for persistence
+- **Job Store:** `apscheduler_jobs` table in PostgreSQL
+- **History:** `job_history` table tracks all executions
+- **Multi-tenant:** Jobs scheduled per-customer with `customer_id` parameter
+- **Initialization:** Lazy-loaded on first request via `@app.before_request` hook
+- **Admin UI:** `/admin/scheduler` for monitoring
+
+### Manual Trigger Jobs
+
+| Job | Service Method | Recommended Schedule | Purpose |
+|-----|----------------|---------------------|---------|
+| Monthly Invoice Generation | `InvoicingService.generate_monthly_invoices()` | 1st of month, 00:01 | Create invoices for all billing-enabled customers |
+| Overdue Invoice Processing | `InvoicingService.process_overdue_invoices()` | Daily, 06:00 (after 20th) | Auto-charge cards for unpaid invoices past due |
+| Command Center Cache Refresh | `CommandCenterCacheService.refresh_cache()` | Every 15 minutes | Pre-compute dashboard metrics |
+| Low Stock Alert Check | `LowStockAlertService.check_all_items()` | Every 4 hours | Send alerts for items below reorder point |
+| Variance Alert Processing | `VarianceAnalysisService.process_alerts()` | Daily, 23:00 | Aggregate daily variance and send alerts |
+
+### Roadmap (Post-Seed)
+
+| Job | Purpose | Priority |
+|-----|---------|----------|
+| Supplier Performance Scoring | Weekly supplier reliability calculation | Medium |
+| Statement Reconciliation | Monthly Xero statement matching | Low |
+| Inventory Prediction | Weekly demand forecasting | Medium |
+
+### Trigger Mechanisms
+
+1. **APScheduler Automated:** Background thread with persistent job store
+2. **SaaS Admin Manual Trigger:** UI buttons in admin dashboard
+3. **API Endpoints:** Direct calls to `/api/v1/sizzlestack/jobs/*`
+
+---
+
+## Mythic-to-Business Name Mapping
+
+| Legacy (Mythic) Name | Business Function | Service File | Refactor Status |
+|----------------------|-------------------|--------------|-----------------|
+| `KeeperOfTheFlame` | Inventory Management Service | `keeper_of_the_flame.py` | Pending rename |
+| `GuardianOfGold` | Financial Management Service | `guardian_of_gold.py` | Pending rename |
+| `OracleBrainInterpreter` | Natural Language Query Processor | `oracle_brain_interpreter.py` | Pending rename |
+| `SovereignSignal` | System Health Monitor | `sovereign_signal.py` | Pending rename |
+| `SovereignSwitchMonitor` | POS Migration Readiness Tracker | `sovereign_switch_monitor.py` | Pending rename |
+| `SovereignOperationalSuite` | Unified Operations Dashboard | `sovereign_operational_suite.py` | Pending rename |
+| `LoomOfTheWeekAgent` | Weekly Schedule Generator | `loom_of_the_week_agent.py` | Pending rename |
+| `SacredArchiveKeeper` | Report Archive System | `archive_delivery_system.py` | Pending rename |
+| `SizzleChronicler` | Audit Log System | `sizzle_log_system.py` | Pending rename |
+| `RitualRegistry` | Query Intent Registry | `oracle_brain_interpreter.py` | Pending rename |
+| `ScrollPresentation` | Report Template | `council_ceremony.py` | Pending rename |
+| `SovereignIntelligence` | Business Intelligence Engine | `oracle_brain_interpreter.py` | Pending rename |
+
+### Mythic Terms in Models
+
+| Legacy Term | Business Meaning |
+|-------------|------------------|
+| `Scroll` | Report/Document Template |
+| `ScrollLog` | Document Generation Audit |
+| `ScrollFatigueLog` | User Report Engagement Metrics |
+| `NarratorProfile` | AI Persona Configuration |
+| `VibeHistory` | Sentiment/Mood Tracking |
+| `MenuItemScroll` | Menu Item Template |
+| `DraftPurchaseOrderScroll` | Purchase Order Draft |
+
+---
+
+## Seed Data Structure
+
+### Seeder Class: `seed_data.py`
+
+The `SizzleStackSeeder` class populates development/demo environments with realistic test data.
+
+### Data Categories
+
+**1. Locations (5 demo venues)**
+```python
+locations_data = [
+    {'name': 'The Ember Hearth - Downtown', 'timezone': 'America/Los_Angeles', ...},
+    {'name': 'Mystic Grove Sanctuary', ...},
+    {'name': 'Sizzle Station Express', ...},
+    {'name': 'Flame & Fortune Casino', ...},
+    {'name': 'Wisdom Well Campus', ...}
+]
+```
+
+**2. Narrator Profiles (AI Personas)**
+- Multiple personality types for demo mode
+- Configurable tone and communication style
+
+**3. Staff Profiles**
+- Role-based staff members (barista, floor, kitchen)
+- Skill levels and availability patterns
+
+**4. Vibe Archetypes**
+- Atmospheric presets for demo scenarios
+- Emotional intelligence baseline data
+
+**5. Performance Baselines**
+- Historical performance data for variance calculations
+- Fatigue and engagement metrics
+
+### Running Seed Data
+
+```python
+from seed_data import SizzleStackSeeder
+
+seeder = SizzleStackSeeder()
+summary = seeder.deploy_all_seed_data()
+print(summary)
+```
+
+### Seed Methods
+
+```python
+seeder.seed_locations(session)              # Multi-site locations
+seeder.seed_narrator_profiles(session)       # AI personality profiles
+seeder.seed_vibe_archetypes(session)         # Emotional baselines
+seeder.seed_staff_profiles(session)          # Demo staff members
+seeder.seed_narrator_performance_baseline(session)
+seeder.seed_staff_fatigue_baseline(session)
+seeder.seed_scroll_interaction_history(session)
+```
+
+---
+
+## POS Connector Testing Notes
+
+### Toast Connector (`sizzlebridge/connectors/toast.py`)
+
+**Environment Variables Required:**
+```bash
+TOAST_API_KEY=<your_api_key>
+TOAST_API_URL=https://api.toasttab.com  # Optional, defaults to this
+TOAST_RESTAURANT_ID=<restaurant_external_id>
+```
+
+**Mock Data Pattern:**
+```python
+mock_toast_order = {
+    'guid': 'test-order-123',
+    'openedDate': '2025-01-15T10:30:00Z',
+    'checks': [{
+        'totalAmount': 25.50,
+        'taxAmount': 3.83,
+        'tipAmount': 5.00,
+        'selections': [
+            {'name': 'Flat White', 'price': 5.50, 'quantity': 1}
+        ]
+    }]
+}
+```
+
+**Testing Approach:**
+1. Use pytest fixtures to mock `requests.Session`
+2. Test normalization separately from API calls
+3. Verify retry logic with mocked 429/503 responses
+
+### Square Connector (`sizzlebridge/connectors/square.py`)
+
+**Environment Variables Required:**
+```bash
+SQUARE_ACCESS_TOKEN=<sandbox_access_token>
+SQUARE_LOCATION_ID=<location_id>
+SQUARE_ENVIRONMENT=sandbox  # or 'production'
+```
+
+**Mock Data Pattern:**
+```python
+mock_square_payment = {
+    'id': 'sq-payment-123',
+    'amount_money': {'amount': 2500, 'currency': 'NZD'},
+    'status': 'COMPLETED',
+    'created_at': '2025-01-15T10:30:00Z'
+}
+```
+
+### Windcave Connector
+
+**Environment Variables Required:**
+```bash
+WINDCAVE_API_KEY=<api_key>
+WINDCAVE_API_SECRET=<api_secret>
+WINDCAVE_MERCHANT_ID=<merchant_id>
+```
+
+**NZ-Specific Notes:**
+- EFTPOS integration requires separate terminal configuration
+- Test with sandbox credentials before production
+- Reconciliation happens async (check `sacred_chronicle_windcave.json`)
+
+### Xero Connector
+
+**Environment Variables Required:**
+```bash
+XERO_CLIENT_ID=<oauth_client_id>
+XERO_CLIENT_SECRET=<oauth_client_secret>
+XERO_TENANT_ID=<tenant_id>  # Set after OAuth flow
+```
+
+**OAuth Flow:**
+1. Redirect to Xero authorization URL
+2. Capture authorization code
+3. Exchange for access/refresh tokens
+4. Store tokens securely (encrypted in DB)
+
+---
+
+## Known Technical Debt
+
+### March 2025 Pre-Seed Pitch Prioritization
+
+External technical review (November 2025) identified four critical areas. Prioritized by investor credibility impact:
+
+| Priority | Issue | Investor Perspective | Status |
+|----------|-------|---------------------|--------|
+| **P1** | Background Job Scheduler | Reliability & Professionalism. Enterprise platforms must run autonomously. Manual triggers = critical red flag for stability. | **DONE** (v1.2.6) |
+| **P1** | Authentication Gap (JWT/API Keys) | Integration & Security. SizzleBridge value requires robust API for partners. Session-only auth stops "How do we integrate?" dead. | **DONE** (v1.2.6) |
+| **P2** | Holiday Hardcoding | Market Scalability Narrative. Small fix, high leverage. Demonstrates global market thinking from day one. | **DONE** (RegionalHoliday model) |
+| **P3** | Monolithic routes.py | Internal Dev Velocity. Velocity tax, not functional blocker. Acknowledge as known debt with refactoring plan. | **IN PROGRESS** (Ordering done) |
+
+### P1: Background Job Scheduler ✅ COMPLETE
+
+**Status:** Shipped in v1.2.6 (Nov 2025)
+
+**Implementation:** `services/scheduler_service.py` (515 lines)
+- APScheduler with SQLAlchemyJobStore for persistence across restarts
+- `JobHistory` model for execution audit trail (status, duration, error tracking)
+- Three scheduled jobs:
+  - **POS Data Sync** - Every 5 minutes per tenant
+  - **Sales Forecast Refresh** - Daily at 02:00 NZT
+  - **Alert Health Check** - Every 1 minute (system-wide monitoring)
+- Error handling: Full traceback logging, email notifications via SendGrid
+- Dashboard alerts: Sync failure flags surface in admin UI
+- Admin UI: `/admin/scheduler` with job queue status, history table, sync health
+
+**Why APScheduler:** Fits existing Flask/SQLAlchemy stack without microservices separation. Lean, appropriate for current scale.
+
+### P1: Authentication Gap ✅ COMPLETE
+
+**Status:** Shipped in v1.2.6 (Nov 2025)
+
+**Implementation:** 
+- `services/auth_service.py` - JWT and API key services
+- `blueprints/api_auth.py` - Token generation and key management API (512 lines)
+- `ApiKey` and `ApiKeyAuditLog` models with SHA256 hashed key storage
+
+**Features:**
+- JWT tokens: Short-lived (1hr default, max 24hr) with `@jwt_required` decorator
+- API keys: Long-lived M2M keys with `@api_key_required` decorator
+- Scope-based permissions: `read/write:sales`, `inventory`, `staff`, `suppliers`, `reports`
+- Dual auth decorator: `@api_auth_required` accepts either JWT or API key
+- Admin UI: `/admin/api-keys` for key creation, viewing, and revocation
+- Security: IP allowlist, expiration dates, rate limit metadata, audit logging
+
+**Endpoints:**
+- `POST /api/v1/auth/token` - Generate JWT token
+- `POST /api/v1/auth/token/refresh` - Generate refresh token
+- `POST /api/v1/auth/token/validate` - Validate token
+- `GET /api/v1/auth/keys` - List API keys
+- `POST /api/v1/auth/keys` - Create API key
+- `DELETE /api/v1/auth/keys/:id` - Revoke key
+
+### P2: Holiday Hardcoding ✅ COMPLETE
+
+**Status:** Shipped (Nov 2025)
+
+**Implementation:**
+- `RegionalHoliday` model in `models.py` (line 3983)
+- Database-driven holiday lookup in `services/sales_forecasting_service.py`
+- Seed data for NZ, AU, UK public holidays 2025-2026
+- Tenant `region_code` field (default: 'NZ') for automatic holiday selection
+- Admin endpoint `/api/v1/auth/admin/regions_supported` demonstrates expansion readiness
+
+**Investor Narrative:** "NZ-first but architected for global" - demonstrates intentional design for scale.
+
+### P3: Monolithic routes.py 🔄 IN PROGRESS
+
+**Current State:** routes.py at 13,301 lines (legacy UI routes)
+
+**Progress:** 14 blueprints registered and active (see Routes Refactor Status above)
+
+**Remaining in routes.py:**
+- Legacy UI routes (dashboards, forms, reports)
+- Roster management routes
+- Day close workflow
+- Some intelligence dashboard routes
+
+**Migration Approach:**
+1. New features always go in blueprints
+2. Extract legacy routes incrementally (Roster, DayClose next)
+3. Unit test each slice before deregistering legacy routes
+4. Keep shared helpers in `services/`
+
+**Estimated Remaining Effort:** 1-2 weeks for full extraction. Continue post-pitch.
+
+### Additional Technical Debt
+
+| Issue | Location | Impact | Remediation |
+|-------|----------|--------|-------------|
+| Mythic naming throughout codebase | All `services/` | Developer confusion | Gradual rename with aliases |
+| No API versioning enforcement | All `/api/*` routes | Breaking change risk | Implement versioned routers |
+| No connection pooling metrics | `database.py` | Performance blind spot | Add SQLAlchemy event listeners |
+| Incomplete test coverage | `tests/` | Regression risk | Expand test suite |
+| No rate limiting | All API routes | Abuse vulnerability | Add Flask-Limiter |
+| Demo mode mixed with production code | Multiple services | Code complexity | Extract demo layer |
+
+### Technical Debt Metrics (Updated Nov 2025)
+
+- **P1 Items:** ✅ COMPLETE (Scheduler + API Auth shipped)
+- **P2 Items:** ✅ COMPLETE (RegionalHoliday shipped)
+- **P3 Items (Defer with plan):** ~1-2 weeks remaining for full routes extraction
+- **Risk Level:** LOW - All critical items resolved
+- **Investor Impact:** Platform is now "production-ready enterprise integration platform" with automated job scheduling, dual-mode API authentication, and multi-region holiday support
+
+### Post-Pitch Enhancements (Engineering Polish)
+
+These are not technical debt - the current implementation is correct and functional. These are **engineering polish items** to be addressed after the March 2025 pitch when the green numbers are validated with real testbed data.
+
+| Enhancement | Purpose | Impact | Priority |
+|-------------|---------|--------|----------|
+| Scheduler circuit breaker | Prevent cascading failures if POS sync fails repeatedly | Resilience | When scaling |
+| Service naming legend | Document mythic → enterprise name mapping for new developers | Onboarding | When hiring |
+| Invoice OCR dedicated dashboard | Expose existing OCR intelligence in standalone UI | Visibility | Post-pitch |
+| Financial Congruence dashboard | Expose Triangle of Truth alerts in standalone UI | Visibility | Post-pitch |
+| API rate limiting (Flask-Limiter) | Prevent abuse on public API endpoints | Security | Before SizzleBridge partners |
+
+**Guiding principle:** None of these grow the two green numbers. Ship them when there's breathing room, not before proving core value.
+
+### Routes Refactor Strategy (Nov 2025)
+
+#### Current State Analysis
+
+- **routes.py:** 13,301 lines, 241 route definitions
+- **14 Blueprints Already Active:** See list below
+- **Architecture:** Flask monolith with service layer → transitioning to domain-driven blueprints
+
+#### Route Inventory (What Remains in routes.py)
+
+| Domain | Route Count | Complexity | Priority |
+|--------|-------------|------------|----------|
+| `/api/*` (misc APIs) | 134 | High | Phase 2-3 |
+| `/saas-admin/*` | 18 | Medium | Phase 1 |
+| `/settings/*` | 6 | Low | Phase 2 |
+| `/billing/*` | 4 | Medium | Phase 1 |
+| `/reports/*` | 4 | Low | Phase 2 |
+| `/labour-*` (dashboards) | 3 | Medium | Phase 1 |
+| `/crew/*`, `/leave/*` | 8 | Low | Phase 2 |
+| Auth (login/signup/2fa) | 4 | Medium | Phase 1 |
+| Single-page dashboards | ~60 | Low | Phase 3 |
+
+#### 14 Blueprints Already Registered (app.py)
+
+| Blueprint | Domain | Status |
+|-----------|--------|--------|
+| `ordering_bp` | Purchase orders, receiving, supplier catalog | ✅ Active |
+| `api_auth_bp` | JWT tokens, API key management | ✅ Active |
+| `admin_bp` | SaaS admin, scheduler, billing | ✅ Active |
+| `analytics` | Reporting and dashboards | ✅ Active |
+| `labour_bp` | Labour intelligence, roster management | ✅ Active |
+| `data_bp` | Data exports and imports | ✅ Active |
+| `aspp_inventory` | ASPP inventory operations | ✅ Active |
+| `aspp_recipes` | ASPP recipe management | ✅ Active |
+| `aspp_sales` | ASPP sales tracking | ✅ Active |
+| `aspp_automation` | ASPP workflow automation | ✅ Active |
+| `aspp_variance` | ASPP variance analysis | ✅ Active |
+| `aspp_waste` | ASPP waste tracking | ✅ Active |
+| `aspp_make_waste_bp` | ASPP make/waste operations | ✅ Active |
+| `aspp_invoices` | ASPP invoice handling | ✅ Active |
+| `aspp_statements` | ASPP statement reconciliation | ✅ Active |
+
+#### Phased Extraction Plan
+
+**Phase 1: Core Business Routes (Q1 2026, ~3 days)**
+Target: Routes critical for daily operations and investor demos
+
+| New Blueprint | Routes to Extract | Est. Lines | Timeline |
+|---------------|------------------|------------|----------|
+| `auth_bp` | `/login`, `/signup`, `/logout`, `/verify-2fa` | ~400 | 0.5 days |
+| `billing_bp` | `/billing/*`, webhook handlers | ~300 | 0.5 days |
+| `saas_admin_bp` | `/saas-admin/*` (18 routes) | ~800 | 1 day |
+| `labour_ui_bp` | `/labour-roster`, `/labour-dashboard`, `/labour-clock` | ~400 | 1 day |
+
+**Phase 2: Operational Dashboards (Q1 2026, ~3 days)**
+Target: Intelligence and reporting UIs
+
+| New Blueprint | Routes to Extract | Est. Lines | Timeline |
+|---------------|------------------|------------|----------|
+| `intelligence_bp` | `/command-center`, `/variance-analysis`, `/reorder-intelligence` | ~500 | 1 day |
+| `settings_bp` | `/settings/*` | ~300 | 0.5 days |
+| `reports_bp` | `/reports/*` | ~400 | 0.5 days |
+| `crew_bp` | `/crew/*`, `/leave/*`, `/staff-tracker` | ~500 | 1 day |
+
+**Phase 3: API Consolidation (Q2 2026, ~4 days)**
+Target: Remaining `/api/*` routes into versioned API blueprints
+
+| New Blueprint | Routes to Extract | Est. Lines | Timeline |
+|---------------|------------------|------------|----------|
+| `api_oracle_bp` | `/api/oracle/*`, `/api/sovereign/*` | ~800 | 1.5 days |
+| `api_inventory_bp` | `/api/inventory/*`, `/api/financial/*` | ~600 | 1 day |
+| `api_loom_bp` | `/api/loom/*` (scheduling) | ~400 | 0.5 days |
+| `legacy_ui_bp` | Remaining single-page dashboards | ~2000 | 1 day |
+
+#### Timeline Summary
+
+| Phase | Scope | Duration | Target Completion |
+|-------|-------|----------|-------------------|
+| Phase 1 | Core Business Routes | 3 days | Jan 2026 |
+| Phase 2 | Operational Dashboards | 3 days | Feb 2026 |
+| Phase 3 | API Consolidation | 4 days | Mar 2026 |
+| **Total** | **Full extraction** | **10 days** | **Q1 2026** |
+
+#### Migration Principles
+
+1. **Zero Downtime:** Legacy routes remain until blueprint is tested and deployed
+2. **Service Layer Unchanged:** Blueprints call existing services; no business logic refactoring
+3. **Test Before Deregister:** Each domain gets integration tests before legacy routes are removed
+4. **New Features in Blueprints:** All new development uses blueprint architecture
+5. **Import Adapters:** Shared helpers remain in `services/` or `utils/`
+
+#### Investor Narrative
+
+> "We have 14 active blueprints handling API authentication, ordering, labour intelligence, and data operations. The remaining routes.py contains legacy UI routes that are being systematically extracted. All new development follows the blueprint architecture—this is active, in-flight modernization, not deferred tech debt."
+
+#### Success Metrics
+
+- [ ] Phase 1 complete: routes.py < 10,000 lines
+- [ ] Phase 2 complete: routes.py < 7,000 lines
+- [ ] Phase 3 complete: routes.py < 3,000 lines (core shell only)
+- [ ] Final state: routes.py contains only app initialization and shared middleware
+
+---
+
+## Authentication & Security
+
+### User Authentication
+
+- Flask-Login session management
+- Werkzeug password hashing (pbkdf2:sha256)
+- TOTP 2FA with backup codes (pyotp)
+- Lockout after 5 failed attempts (30-minute window)
+
+### SaaS Admin Panel
+
+**Route:** `/saas-admin/*`
+
+**Security:**
+- Separate `is_saas_admin` flag on User model
+- 2FA mandatory for admin access
+- Password change requires current password
+- Session timeout: 24 hours
+
+**Capabilities:**
+- Cross-tenant customer management
+- Billing/invoicing administration
+- Platform-wide analytics
+
+### API Authentication
+
+- Session-based for web routes
+- Tenant context validation on all API endpoints
+- Rate limiting via Gunicorn worker pool
+
+---
+
+## Database Schema Summary
+
+### Tenant Core (6 tables)
+`Customer`, `CustomerVenue`, `User`, `Location`, `NarratorProfile`, `StaffProfile`
+
+### Inventory Domain (12 tables)
+`InventoryItem`, `Recipe`, `RecipeComponent`, `RecipeSale`, `RecipeSaleSession`, `IngredientConsumptionEvent`, `WasteEvent`, `MakeBenchWasteEvent`, `StocktakeSession`, `StocktakeCount`, `POSMenuItemMapping`, `MenuItemScroll`
+
+### Supplier Domain (10 tables)
+`Supplier`, `SupplierProduct`, `SupplierPriceHistory`, `Invoice`, `InvoiceItem`, `InvoiceItemCategory`, `GoodsReceipt`, `SupplierStatement`, `SupplierPerformance`, `DraftPurchaseOrderScroll`
+
+### Labour Domain (4 tables)
+`StaffRoster`, `ClockEvent`, `LabourVariancePeriod`, `LabourBudget`
+
+### Financial Domain (7 tables)
+`SalesForecast`, `ForecastBaseline`, `ForecastOverride`, `FinancialCongruenceConfig`, `CongruenceAlert`, `CongruenceOverrideLog`, `CongruenceMonitoringLog`
+
+### Billing Domain (2 tables)
+`Customer` (billing fields), `CustomerInvoice`
+
+### System/Audit (8 tables)
+`AuditLog`, `AnalyticsEvent`, `ScrollLog`, `Scroll`, `ScrollFatigueLog`, `ASPPTaskLog`, `CommandCenterCache`, `DayClose`
+
+---
+
+## Coded But Not UI-Exposed Features
+
+The following features have complete backend implementations but lack frontend exposure:
+
+| Feature | Service/Module | Status |
+|---------|----------------|--------|
+| AI Invoice OCR | `services/invoice_ocr_service.py` | Service complete, UI partial |
+| Emotional Intelligence Layer | `services/emotional_intelligence_layer.py` | Demo mode only |
+| Loom of the Week Agent | `services/loom_of_the_week_agent.py` | API only |
+| Sovereign Switch Monitor | `services/sovereign_switch_monitor.py` | Internal use |
+| Financial Congruence Engine | `services/financial_congruence_service.py` | API endpoints exist, no dashboard |
+| Te Ara Hou Curriculum | `services/te_ara_hou_curriculum.py` | Training module, no UI |
+| Xero Reconciliation | `services/xero_reconciliation_engine.py` | Service complete, no UI |
+| Statement Reconciliation | `services/statement_reconciliation_service.py` | API only |
+| PO Matching Engine | `services/po_matching_service.py` | Backend only |
+| Supplier Performance Scoring | `services/supplier_intelligence_service.py` | Calculations exist, minimal UI |
+| Day Close Intelligence | `services/day_close_intelligence_service.py` | Complete service, no UI |
+| Command Center Cache | `services/command_center_cache_service.py` | Pre-computation, internal |
+| Live Oracle Integration | `services/live_oracle_integration.py` | Demo orchestration |
+| Apprentice Simulation | `services/apprentice_simulation_engine.py` | Training tool, no UI |
+| Admin Metrics Service | `services/admin_metrics_service.py` | SaaS admin analytics, API only |
+| Franchise Transmission | `services/franchise_transmission.py` | Multi-location sync, no UI |
+| Discovery Protocol | `services/discovery_protocol.py` | POS detection, internal only |
+| API Decoupling | `services/api_decoupling.py` | Telemetry, no dashboard |
+
+---
+
+## API Endpoints Summary
+
+### SaaS Admin Routes
+```
+GET  /saas-admin                           # Dashboard
+GET  /saas-admin/billing                   # Billing overview
+GET  /saas-admin/billing/customer/:id      # Customer billing detail
+POST /saas-admin/billing/invoice/:id/send  # Send invoice email
+POST /saas-admin/billing/invoice/:id/charge # Charge card on file
+GET  /saas-admin/security                  # 2FA management
+```
+
+### Operational APIs
+```
+GET  /api/v1/sizzlestack/command-center/dashboard
+GET  /api/v1/sizzlestack/variance/dashboard
+GET  /api/v1/sizzlestack/labour/roster
+POST /api/v1/sizzlestack/labour/clock
+GET  /api/v1/sizzlestack/labour/variance
+GET  /api/v1/sizzlestack/reorder-intelligence/recommendations
+POST /api/v1/sizzlestack/purchase-order/draft
+GET  /api/v1/sizzlestack/supplier-catalog/suppliers
+GET  /api/v1/sizzlestack/alerts/summary
+```
+
+### Webhook Endpoints
+```
+POST /webhooks/stripe                      # Stripe payment webhooks
+```
+
+---
+
+## Environment Variables
+
+### Required Secrets
+```
+DATABASE_URL           # PostgreSQL connection string
+SESSION_SECRET         # Flask session encryption
+STRIPE_SECRET_KEY      # Stripe API key
+STRIPE_PUBLISHABLE_KEY # Stripe frontend key
+STRIPE_WEBHOOK_SECRET  # Stripe webhook validation
+SENDGRID_API_KEY       # Email service
+OPENAI_API_KEY         # Invoice OCR
+```
+
+### Optional Secrets
+```
+SQUARE_ACCESS_TOKEN    # Square POS integration
+TOAST_API_KEY          # Toast POS integration
+TOAST_API_URL          # Toast API endpoint
+TOAST_RESTAURANT_ID    # Toast restaurant identifier
+XERO_CLIENT_ID         # Xero accounting
+XERO_CLIENT_SECRET     # Xero OAuth
+```
+
+---
+
+## Testing
+
+### Test Framework
+- pytest with pytest-flask
+- Test database isolation
+- Fixture-based tenant setup
+
+### Test Files
+```
+tests/
+├── test_admin_functions.py      # SaaS admin functionality
+├── test_http_isolation.py       # HTTP-level tenant isolation
+├── test_http_tenant_isolation.py # Cross-tenant access prevention
+├── test_scroll_isolation.py     # Document access controls
+└── test_tenant_isolation.py     # Database-level isolation
+```
+
+### Coverage Areas
+- Multi-tenant isolation tests
+- Service layer unit tests
+- Route integration tests
+- SizzleBridge connector mocks
+
+### Run Tests
+```bash
+pytest tests/ -v
+pytest tests/test_tenant_isolation.py -v  # Specific test file
+pytest tests/ -k "isolation" -v            # Pattern matching
+```
+
+---
+
+## Deployment
+
+### Production Configuration
+- Gunicorn with `--reload` for development
+- Port 5000 binding
+- ProxyFix middleware for HTTPS
+
+### Workflow Command
+```bash
+gunicorn --bind 0.0.0.0:5000 --reuse-port --reload main:app
+```
+
+### Database Migrations
+SQLAlchemy `db.create_all()` on startup (development mode)
+Production: Manual migration scripts in `/migrations`
+
+---
+
+## Canonical Event Taxonomy
+
+### Overview
+
+SizzleStack defines a canonical event taxonomy (`sizzlecore/events.py`) that unifies event naming across simulation, production services, and analytics. All events should use these standardized definitions to ensure:
+
+1. **Consistency:** Unified naming across simulation harness and production code
+2. **Auditability:** Events map directly to the three green number pillars
+3. **ML Readiness:** Structured event data suitable for model training
+4. **Investor Transparency:** Clear mapping from alerts to claimed ROI
+
+### Event Categories (Green Number Pillars)
+
+| Category | Green Number | Description | Example Event Types |
+|----------|--------------|-------------|---------------------|
+| `FOOD_COST` | #1: Food Cost Recovery | Supplier overcharges, waste, variance | `PRICE_CREEP_DETECTED`, `SPOILAGE_DETECTED`, `WASTE_RECORDED` |
+| `LABOUR_COST` | #2: Labour Cost Recovery | Staffing efficiency, roster variance | `OVERSTAFFING_DETECTED`, `UNDERSTAFFING_DETECTED`, `ROSTER_VARIANCE` |
+| `AUTOMATION` | #3: Automation Savings | Time-saving automations | `INVOICE_OCR_COMPLETED`, `PO_AUTO_GENERATED`, `EMAIL_AUTO_SENT` |
+| `SYSTEM` | (Internal) | Platform health events | `CONNECTOR_SYNC`, `CACHE_REFRESHED`, `HEALTH_CHECK` |
+| `FINANCIAL` | (Internal) | Billing and payments | `INVOICE_CREATED`, `PAYMENT_RECEIVED` |
+| `COMPLIANCE` | (Internal) | Audit and security | `USER_LOGIN`, `OVERRIDE_APPROVED`, `DATA_EXPORT` |
+
+### Event Type Inventory
+
+**Food Cost Events (Green Number 1):**
+```
+SPOILAGE_DETECTED         - Inventory spoilage detected
+WASTE_RECORDED            - Waste event logged
+VARIANCE_THRESHOLD_EXCEEDED - Usage variance above threshold
+PRICE_CREEP_DETECTED      - Supplier price increase detected
+LOW_STOCK_ALERT           - Inventory below reorder point
+STOCKOUT_RISK             - Predicted stockout
+REORDER_SUGGESTED         - Auto-reorder recommendation
+CONSUMPTION_LOGGED        - Sales consumption event
+INVENTORY_ADJUSTED        - Manual inventory adjustment
+RECIPE_COST_CHANGED       - Recipe cost recalculated
+```
+
+**Labour Cost Events (Green Number 2):**
+```
+OVERSTAFFING_DETECTED     - Actual hours > theoretical
+UNDERSTAFFING_DETECTED    - Actual hours < theoretical
+ROSTER_VARIANCE           - Scheduled vs actual discrepancy
+CLOCK_IN / CLOCK_OUT      - Time clock events
+SHIFT_STARTED / SHIFT_ENDED - Shift lifecycle
+BREAK_STARTED / BREAK_ENDED - Break tracking
+PRODUCTIVITY_ALERT        - Performance threshold crossed
+FORECAST_VARIANCE         - Sales forecast vs actual
+```
+
+**Automation Events (Green Number 3):**
+```
+INVOICE_OCR_PROCESSED     - Invoice OCR execution
+INVOICE_OCR_COMPLETED     - Successful OCR parse
+INVOICE_OCR_FAILED        - OCR parse failure
+INVOICE_RECEIVED          - Invoice logged
+INVOICE_PO_MATCHED        - Invoice matched to PO
+PO_AUTO_GENERATED         - Automated PO creation
+PO_MATCHED                - PO matched to receiving
+PO_VARIANCE_DETECTED      - PO vs invoice variance
+INVOICE_DUPLICATE_DETECTED - Duplicate invoice caught
+SUPPLIER_CATALOG_LEARNED  - Supplier catalog auto-learned
+ALERT_AUTO_GENERATED      - Automated alert dispatch
+EMAIL_AUTO_SENT           - Auto-email sent
+RECONCILIATION_COMPLETED  - Account reconciliation done
+MARGIN_EROSION_ALERT      - Margin below threshold
+```
+
+### SizzleEvent Structure
+
+```python
+@dataclass
+class SizzleEvent:
+    event_id: str              # UUID
+    event_type: EventType      # Canonical type enum
+    category: EventCategory    # Green number category
+    severity: EventSeverity    # DEBUG/INFO/LOW/MEDIUM/HIGH/CRITICAL
+    summary: str               # Human-readable description
+    timestamp: datetime        # UTC timestamp
+    value: float               # Dollar amount or hours
+    value_unit: str            # "dollars", "hours", "units"
+    entity_type: str           # "ingredient", "staff", "invoice"
+    entity_id: str             # Specific entity identifier
+    source_service: str        # Originating service name
+    customer_id: int           # Tenant isolation
+    ground_truth: GroundTruth  # Simulation validation (optional)
+    metadata: Dict[str, Any]   # Additional context
+```
+
+### Ground Truth Classification (Simulation)
+
+| Classification | Description | Use Case |
+|---------------|-------------|----------|
+| `TRUE_POSITIVE` | Alert fired for real issue | Precision calculation |
+| `FALSE_POSITIVE` | Alert fired, no issue | False positive rate |
+| `TRUE_NEGATIVE` | No alert, no issue | System accuracy |
+| `FALSE_NEGATIVE` | No alert, issue existed | Recall calculation |
+
+### Legacy Event Mapping
+
+The `LEGACY_TO_CANONICAL` dictionary maps deprecated mythic naming to canonical types:
+
+```python
+LEGACY_TO_CANONICAL = {
+    "sacred_pivot": EventType.ROSTER_VARIANCE,
+    "sovereign_override": EventType.OVERRIDE_APPROVED,
+    "threshold_crossing": EventType.VARIANCE_THRESHOLD_EXCEEDED,
+    "scrollkeeper_note": EventType.AUDIT_LOG_ENTRY,
+    "price_creep": EventType.PRICE_CREEP_DETECTED,
+    "overstaffing": EventType.OVERSTAFFING_DETECTED,
+    # ... (see sizzlecore/events.py for full mapping)
+}
+```
+
+### Production Service Adapters
+
+`sizzlecore/production_adapters.py` provides adapter classes for converting production service alerts to canonical events:
+
+- `ProductionEventAdapter`: Converts `OperationalAlert` and service-specific alerts
+- `EventAggregator`: Aggregates events for green number calculation
+
+### Usage Examples
+
+**Creating a Food Cost Event:**
+```python
+from sizzlecore.events import create_food_cost_event, EventType
+
+event = create_food_cost_event(
+    event_type=EventType.PRICE_CREEP_DETECTED,
+    summary="Milk price increased 8% from Sysco",
+    value=15.50,
+    entity_type="supplier_item",
+    entity_id="sysco:milk-2l"
+)
+```
+
+**Aggregating Green Numbers:**
+```python
+from sizzlecore.production_adapters import EventAggregator
+
+aggregator = EventAggregator()
+for alert in production_alerts:
+    aggregator.add_operational_alert(alert)
+
+green_numbers = aggregator.get_green_numbers()
+# Returns: {'food_cost_recovery': 663.53, 'labour_cost_recovery': 3413.49, 'automation_hours_saved': 51.2}
+```
+
+### Architecture Integration
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Event Flow Architecture                      │
+└─────────────────────────────────────────────────────────────────┘
+
+     Production Services              Simulation Harness
+     ─────────────────────            ──────────────────
+     │ LowStockAlertService │         │ SimulationOrchestrator │
+     │ VarianceAnalysisService │      │ AlertTracker            │
+     │ LabourOptimizationService │    │ ChaosEngine             │
+     └───────────┬───────────┘        └───────────┬───────────┘
+                 │                                 │
+                 ▼                                 ▼
+     ┌───────────────────────────────────────────────────────────┐
+     │                ProductionEventAdapter                      │
+     │                AlertEvent.to_sizzle_event()                │
+     └───────────────────────────┬───────────────────────────────┘
+                                 │
+                                 ▼
+     ┌───────────────────────────────────────────────────────────┐
+     │              sizzlecore/events.py                          │
+     │    EventType | EventCategory | SizzleEvent | EventSummary  │
+     └───────────────────────────┬───────────────────────────────┘
+                                 │
+                                 ▼
+     ┌───────────────────────────────────────────────────────────┐
+     │                   EventAggregator                          │
+     │              get_green_numbers() → Dict                    │
+     └───────────────────────────────────────────────────────────┘
+                                 │
+            ┌────────────────────┼────────────────────┐
+            ▼                    ▼                    ▼
+    Command Center       Investor Reports     ML Training Data
+```
+
+---
+
+## Change Log
+
+### 2025-11-28 (v1.2.7)
+- **TER Forecast Trigger - Roster Publish Hook:** Real-time overstaffing detection
+  - New service: `services/ter_forecast_service.py` (~300 lines)
+  - Triggers automatically when manager clicks "Publish Roster"
+  - Compares rostered labour cost vs forecasted budget
+  - Fires email alert if variance > $150 (configurable threshold)
+  - Runtime: <2 seconds, forward-looking only (no historical recalc)
+  - Hooked into `/api/v1/sizzlestack/labour/roster/confirm` endpoint
+  - Response includes `ter_forecast` object with variance analysis
+  - Investor narrative: "SizzleStack catches over-staffing before the shift even starts"
+- **Technical Log Accuracy Audit:** Cross-referenced external review feedback against actual code
+  - Corrected P1/P2 status from TODO → DONE (code was shipped, log was stale)
+  - Updated routes.py line count: was "~8.2k" → actual 13,301 lines
+  - Documented all 14 registered blueprints in app.py
+  - Added implementation details for completed P1 items (scheduler, auth)
+  - Added implementation details for completed P2 item (RegionalHoliday)
+  - Updated Technical Debt Metrics to reflect LOW risk status
+- **Routes Refactor Strategy:** Added comprehensive phased extraction plan
+  - Route inventory analysis: 241 routes across 10+ domains
+  - 3-phase extraction plan with specific timelines (10 days total)
+  - Phase 1 (Jan 2026): Auth, Billing, SaaS Admin, Labour UI
+  - Phase 2 (Feb 2026): Intelligence, Settings, Reports, Crew
+  - Phase 3 (Mar 2026): API consolidation, legacy UI cleanup
+  - Success metrics: routes.py from 13,301 → < 3,000 lines
+  - Investor narrative included
+- **Post-Pitch Enhancements:** New section distinguishing engineering polish from technical debt
+  - Circuit breaker, service naming legend, dashboard UIs, rate limiting
+  - Guiding principle: "None of these grow the two green numbers"
+  - Priority: Address after March 2025 when core value is proven
+- **Investor Readiness:** All P1 and P2 items confirmed complete before March 2025 pitch
+
+### 2025-11-27 (v1.2.6)
+- **Roster Notification Service - Toasted Kiwi Edition:** Complete rewrite with cafe-centric branding
+  - Created `templates/email/roster_confirmation.html` - Pastel sunrise branding, mobile responsive
+  - Created `services/roster_notification_service.py` - Jinja2 template-based, proper separation
+  - Features: 48px total hours hero, approved swaps box, public holiday pay notes (NZ), manager personal note with sign-off
+  - Subject line rotation: "🍞 Roster's live!", "🌅 Your shifts", etc. (warm, human tone)
+  - Dynamic manager name from `customer.contact_name`, NZ public holiday detection via `RegionalHoliday` table
+  - Integrated with `StaffSchedulingEmailService.send_weekly_rosters()`
+
+- **Purchase Order Number Format:** Changed from crypto-hex to human-readable sequential
+  - Old: `PO-20251127-2C743A` → New: `PO-20251127-001`
+  - Daily sequential reset, 3-digit padding, sorts perfectly in spreadsheets
+  - Easy to say over the phone, instant date recognition
+
+- **Supplier Management UI:** Full supplier CRUD in ordering section
+  - Routes: `/ordering/suppliers`, `/ordering/suppliers/new`
+  - Templates: `templates/ordering/suppliers.html`, `new_supplier.html`
+  - Tenant-isolated supplier creation with contact details and notes
+
+- **Manual Line Item Entry for POs:** Enables PO creation for suppliers without catalog products
+  - Added manual item form (name, quantity, unit, price) when no catalog products exist
+  - Backend parses both catalog and manual items via `items_json` hidden field
+  - Full end-to-end workflow: create supplier → add manual items → generate PO
+
+- **Database Schema Fix:** Permanent fix for `customers.region_code` column
+  - Added `ensure_schema_updates()` in `database.py` for startup schema validation
+  - Auto-adds missing `region_code` column with 'NZ' default if absent
+
+### 2025-11-27 (v1.2.5)
+- **P1 Dual-Mode Authentication Strategy:** Enterprise-grade API security for SizzleBridge integrations
+  - Created `ApiKey` and `ApiKeyAuditLog` models with SHA256 hashed key storage
+  - Created `services/auth_service.py` with JWT and API key services
+  - JWT implementation: Short-lived tokens (1hr) with `@jwt_required` decorator
+  - API Key implementation: Long-lived M2M keys with `@api_key_required` decorator
+  - Scope-based permissions system: read/write:sales, inventory, staff, suppliers, reports
+  - Created `blueprints/api_auth.py` for token generation and key management API
+  - Admin UI: `/admin/api-keys` for key creation, viewing, and revocation
+  - Security features: IP allowlist, expiration dates, rate limit metadata, audit logging
+  - Dual auth decorator: `@api_auth_required` accepts either JWT or API key
+
+### 2025-11-27 (v1.2.4)
+- **P1 Background Job Scheduler:** APScheduler-based automation for critical data pipelines
+  - Created `JobHistory` model for execution audit trail (status, duration, error tracking)
+  - Created `services/scheduler_service.py` with SQLAlchemyJobStore persistence
+  - Added Customer sync status fields: `pos_sync_status`, `pos_sync_last_success`, `pos_sync_failure_count`
+  - Three scheduled jobs:
+    - **POS Data Sync** - Every 5 minutes per tenant (real-time variance detection)
+    - **Sales Forecast Refresh** - Daily at 02:00 NZT (overnight processing)
+    - **Alert Health Check** - Every 1 minute (system-wide monitoring)
+  - Error handling: Full traceback logging, email notifications via SendGrid
+  - Dashboard alerts: Sync failure flags surface in admin UI
+  - Admin UI: `/admin/scheduler` with job queue status, history table, sync health
+  - Flask integration: `@app.before_request` hook for lazy initialization
+  - Module-level callable functions for SQLAlchemyJobStore serialization compatibility
+
+### 2025-11-26 (v1.2.3)
+- **Data Import/Export Module:** Full CSV import/export functionality
+  - Created `DataImportLog` model for audit trail tracking
+  - Created `blueprints/data.py` with import, export, and history routes
+  - Templates: `templates/data/import.html`, `export.html`, `history.html`
+  - Import templates: inventory_stock, purchase_order, roster_weekly, sales_daily, stocktake
+  - Export types: bom_current, inventory_full, variance_report, stocktake_template
+  - CSV template files in `static/templates/csv/`
+  - Added "Data" dropdown to navigation between Variance and Admin
+
+### 2025-11-26 (v1.2.2)
+- **Shift Management Reports Suite:** Four operational report pages with demo data fallback
+  - `/reports/sales` - Hourly sales breakdown, GST calculations, payment methods
+  - `/reports/labour` - Staff hours, labour cost %, position breakdown
+  - `/reports/food` - Food cost tracking, top sellers, ingredient usage
+  - `/reports/variance` - Real-time variance analysis, threshold alerts
+  - Fixed pytz import and StaffProfile model references
+  - All reports use GST-exclusive calculations (NZ 15% GST standard)
+  - Demo data generation for investor demonstrations when no live data
+
+### 2025-11-26 (v1.2.1)
+- Added Testbed Admin dashboard (`/testbed-admin`) for investor validation
+- Created `TestbedOverride` model for audit trail logging (who/when/why)
+- Created `DayCloseAlert` model for alert-to-close tracking
+- Implemented day close workflow with checklist items
+- Added manual override capability with reason requirement
+- Added one-click CSV export for investor data room validation artifacts
+
+### 2025-11-26 (v1.2.0)
+- Added Canonical Event Taxonomy (`sizzlecore/events.py`)
+- Created production service adapters (`sizzlecore/production_adapters.py`)
+- Updated simulation harness with event bridge layer
+- Documented event categories, types, and green number mapping
+
+### 2025-11-26 (v1.1.0)
+- Created comprehensive SIZZLE_TECHNICAL_LOG.md
+- Added Service Dependency Map
+- Added Data Flow Diagrams for key workflows
+- Added Error Handling Patterns documentation
+- Added Scheduled Jobs Inventory
+- Added Mythic-to-Business Name Mapping table
+- Added Seed Data Structure documentation
+- Added POS Connector Testing Notes
+- Added Known Technical Debt inventory
+
+### 2025-11-26 (v1.0.0)
+- Added monthly invoicing system with Net 20 payment terms
+- Implemented Stripe Checkout for card-on-file setup
+- Created SaaS admin billing management UI
+- Added CustomerInvoice model with full invoice lifecycle
+- Integrated InvoicingService with Stripe PaymentIntents
+
+### 2025-11-25
+- Fixed 2FA backup code single-use enforcement
+- Added mobile-responsive CSS to SaaS admin pages
+- Corrected SaaS admin login credentials
+
+### Previous
+- See git history for full changelog
+
+---
+
+## Investor Readiness & KPIs
+
+### The Three Green Numbers
+
+SizzleStack's value proposition is validated through three quantifiable metrics demonstrating ROI over traditional POS systems:
+
+| Metric | 90-Day Target | Service | Calculation Method |
+|--------|---------------|---------|-------------------|
+| **Food Cost Recovery** | $663.53 | `VarianceAnalysisService`, `SupplierIntelligenceService` | Supplier overcharges caught + price-creep credits recovered |
+| **Labour Cost Recovery** | $3,413.49 | `OverstaffingDetectionService`, `LabourVarianceService` | Quantified overstaffing eliminated + efficiency optimization |
+| **Automation Savings** | 51.2 hours | `InvoiceOCRService`, `POMatchingService`, `ReorderIntelligenceService` | Manual tasks automated (invoice entry, reorder calculations, reconciliation) |
+
+### Pitch Timeline
+
+| Milestone | Date | Status | Requirements |
+|-----------|------|--------|--------------|
+| **Pre-Seed Pitch** | March 2025 | Preparing | Demo environment, investor deck, testbed baseline metrics |
+| **90-Day Testbed Validation** | Q2 2025 | Pending | Live Toasted Kiwi deployment, real transaction data, validated green numbers |
+| **Seed Pitch** | Q3 2025 | Planned | Proven ROI metrics, multi-tenant readiness, scalability evidence |
+
+### Testbed Configuration
+
+**First live deployment:** Toasted Kiwi, Nelson – opening 2026
+
+**Validation Criteria:**
+- Minimum 90 days of live transaction data
+- At least 3 supplier price-creep detections documented
+- Demonstrated overstaffing identification with $ quantification
+- Invoice OCR accuracy >90% measured
+
+### Competitive Positioning
+
+**vs. Toast POS:**
+- Toast provides sales totals; SizzleStack provides ingredient-level consumption
+- Toast shows labour hours; SizzleStack shows overstaffing cost impact
+- Toast requires manual receiving; SizzleStack auto-learns from invoice photos
+
+**vs. Square POS:**
+- Square tracks sales; SizzleStack calculates theoretical vs actual variance
+- Square shows staff schedules; SizzleStack predicts optimal staffing
+- Square has no supplier intelligence; SizzleStack detects price-creep
+
+### Current Platform Maturity
+
+| Component | Maturity | Notes |
+|-----------|----------|-------|
+| Core Inventory Intelligence | Production-ready | Variance analysis, consumption tracking live |
+| Labour Intelligence | Production-ready | Overstaffing detection, roster variance complete. **Roster-publish TER trigger now live (Dec 2025)** – catches over-staffing before the shift starts. Full real-time TER (stock/invoice/shift triggers) on roadmap for Q2 2026. |
+| Supplier Intelligence | Beta | Price-creep detection works, catalog learning needs tuning |
+| Invoice OCR | Beta | OpenAI Vision integration complete, accuracy validation needed |
+| SizzleBridge (POS Connectors) | Alpha | Toast/Square connectors built, live integration pending |
+| Financial Congruence | Alpha | Service complete, UI needed |
+| Multi-tenant Billing | Production-ready | Stripe integration complete, invoice lifecycle tested |
+
+---
+
+## Roadmap / Known Gaps
+
+1. **Sovereign Switch Activation UI:** Monitoring services exist, production activation pending
+2. **Invoice OCR Dashboard:** Service complete, needs dedicated UI
+3. **Financial Congruence Dashboard:** Backend ready, UI needed
+4. **Xero Reconciliation UI:** Integration complete, no frontend
+5. **Supplier Performance Scorecards:** Data exists, visualization pending
+6. **Multi-venue Support:** Model support exists, UI partial
+7. **Background Job Scheduler:** Currently manual, needs automation
+8. **API Key Authentication:** Session-only currently, JWT needed for external integrations
+
+---
+
+## Contact / Ownership
+
+**Platform:** SizzleStack (Lore Lab Ltd)  
+**Primary Use Case:** First live deployment at Toasted Kiwi (Nelson, NZ – opening 2026)  
+**Pitch Timeline:** Pre-seed March 2025, Seed Q3 2025
+
+---
+
+*This document should be updated after each significant commit. For legacy mythic naming mappings, see the Mythic-to-Business Name Mapping section above.*
